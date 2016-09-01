@@ -16,46 +16,56 @@ import psycopg2
 import sys
 
 
-def compare_dicts(topic, a_db_dict, b_db_dict, a_name, b_name):
-    a_set = set(a_db_dict)
-    b_set = set(b_db_dict)
+def compare_dicts(a, b, path=[]):
+    seen_items = set()
+    for item in sorted(a) + sorted(b):
+        if item in seen_items:
+            continue
+        seen_items.add(item)
 
-    for key in sorted(b_set - a_set):
-        yield "{t} {k} found in {b!r}, missing from {a!r}".format(t=topic, k=key, a=a_name, b=b_name)
+        a_value = a.get(item)
+        b_value = b.get(item)
+        if a_value == b_value:
+            continue
 
-    for key in sorted(a_set - b_set):
-        yield "{t} {k} found in {a!r}, missing from {b!r}".format(t=topic, k=key, a=a_name, b=b_name)
-
-    for key in sorted(a_set & b_set):
-        a_db_info = a_db_dict[key]
-        b_db_info = b_db_dict[key]
-        if a_db_info != b_db_info:
-            if isinstance(a_db_info, dict) and isinstance(b_db_info, dict):
-                yield from compare_dicts("{} {}".format(topic, key), a_db_info, b_db_info, a_name, b_name)
+        itempath = path + [item]
+        itemdesc = " ".join(itempath)
+        if b_value is None:
+            if isinstance(a_value, dict) and len(a_value) == 1:
+                yield "-{} {} {}".format(itemdesc, *a_value.popitem())
             else:
-                yield "{t} {k} is {ia!r} in {a!r}, {ib!r} in {b!r}".format(t=topic, k=key, a=a_name, b=b_name, ia=a_db_info, ib=b_db_info)
+                yield "-{}".format(itemdesc)
+        elif a_value is None:
+            if isinstance(b_value, dict) and len(b_value) == 1:
+                yield "+{} {} {}".format(itemdesc, *b_value.popitem())
+            else:
+                yield "+{}".format(itemdesc)
+        elif not isinstance(a_value, dict) or not isinstance(b_value, dict):
+            yield "-{} {}".format(itemdesc, a_value)
+            yield "+{} {}".format(itemdesc, b_value)
+        else:
+            yield from compare_dicts(a_value, b_value, path=itempath)
 
 
-def compare_queries(topic, a_cursor, b_cursor, a_name, b_name, query, args=[]):
-    a_cursor.execute(query, args)
-    a_db_items = {r["key"]: r["val"] for r in a_cursor.fetchall()}
-    b_cursor.execute(query, args)
-    b_db_items = {r["key"]: r["val"] for r in b_cursor.fetchall()}
-    yield from compare_dicts(topic, a_db_items, b_db_items, a_name, b_name)
+def query_for_comparison(topic, target, cursor, sql, args=[]):
+    cursor.execute(sql, args)
+    for row in cursor.fetchall():
+        key = "{} {!r}".format(topic, row.pop("key"))
+        key_target = target.setdefault(row.pop("table"), {}).setdefault(key, {})
+        key_target.update(row)
 
 
 def compare_schema(a_db, b_db, schemas, ignore_partitions):
     a_cursor = a_db.cursor(cursor_factory=RealDictCursor)
     b_cursor = b_db.cursor(cursor_factory=RealDictCursor)
 
-    a_cursor.execute("SELECT current_database() AS db")
-    a_name = a_cursor.fetchone()["db"]
-    b_cursor.execute("SELECT current_database() AS db")
-    b_name = b_cursor.fetchone()["db"]
-
-    if a_name == b_name:
-        a_name = "{} (a)".format(a_name)
-        b_name = "{} (b)".format(b_name)
+    if not schemas:
+        schemaset = set()
+        a_cursor.execute("SELECT nspname FROM pg_namespace WHERE left(nspname, 3) <> 'pg_'")
+        schemaset.update(row["nspname"] for row in a_cursor.fetchall())
+        b_cursor.execute("SELECT nspname FROM pg_namespace WHERE left(nspname, 3) <> 'pg_'")
+        schemaset.update(row["nspname"] for row in b_cursor.fetchall())
+        schemas = sorted(schemaset)
 
     # partition ignoring is based on names for now
     if ignore_partitions:
@@ -72,65 +82,97 @@ def compare_schema(a_db, b_db, schemas, ignore_partitions):
     else:
         a_parts, b_parts = set(), set()
 
+    a_info = {}
+    b_info = {}
+
     # quick and dirty table / column comparison
     a_cursor.execute("SELECT * FROM information_schema.columns WHERE table_schema = ANY(%s)", [schemas])
     a_db_cols = a_cursor.fetchall()
     b_cursor.execute("SELECT * FROM information_schema.columns WHERE table_schema = ANY(%s)", [schemas])
     b_db_cols = b_cursor.fetchall()
 
-    def cols_for_comparison(cols, ignored_parts):
+    def cols_for_comparison(cols, ignored_parts, target):
         ignored_properties = {"table_catalog", "udt_catalog", "ordinal_position", "dtd_identifier"}
         for col in cols:
-            key = "{}.{}".format(col["table_schema"], col["table_name"])
-            if key in ignored_parts:
+            table = "{}.{}".format(col["table_schema"], col["table_name"])
+            if table in ignored_parts:
                 continue
-            key = "{}.{}".format(key, col["column_name"])
-            yield key, {k: v for k, v in col.items() if k not in ignored_properties and v is not None}
+            key = "Column {!r}".format(col["column_name"])
+            for prop, val in col.items():
+                if prop not in ignored_properties and val is not None:
+                    key_target = target.setdefault(table, {}).setdefault(key, {})
+                    key_target[prop] = val
 
-    a_db_col_dict = dict(cols_for_comparison(a_db_cols, a_parts))
-    b_db_col_dict = dict(cols_for_comparison(b_db_cols, b_parts))
-    yield from compare_dicts("Column", a_db_col_dict, b_db_col_dict, a_name, b_name)
+    cols_for_comparison(a_db_cols, a_parts, a_info)
+    cols_for_comparison(b_db_cols, b_parts, b_info)
 
     # quick and dirty index comparison
     index_sql = """
-        SELECT schemaname || '.' || tablename || '/' || indexname AS key, indexdef AS val
+        SELECT schemaname || '.' || tablename AS table, indexname AS key, indexdef AS definition
             FROM pg_indexes
             WHERE schemaname = ANY(%s)
                 AND NOT (schemaname || '.' || tablename = ANY(%s))
         """
-    yield from compare_queries("Index", a_cursor, b_cursor, a_name, b_name, index_sql, [schemas, list(a_parts | b_parts)])
+    query_for_comparison("Index", a_info, a_cursor, index_sql, [schemas, list(a_parts | b_parts)])
+    query_for_comparison("Index", b_info, b_cursor, index_sql, [schemas, list(a_parts | b_parts)])
 
     # quick and dirty constraint comparison
     const_sql = """
-        SELECT n.nspname || '.' || cl.relname || '/' || co.conname AS key, pg_get_constraintdef(co.oid, true) AS val
+        SELECT n.nspname || '.' || cl.relname AS table, co.conname AS key, pg_get_constraintdef(co.oid, true) AS definition
             FROM pg_constraint AS co
                 JOIN pg_namespace AS n ON (co.connamespace = n.oid)
                 JOIN pg_class AS cl ON (co.conrelid = cl.oid)
             WHERE n.nspname = ANY(%s)
                 AND NOT (n.nspname || '.' || cl.relname = ANY(%s))
         """
-    yield from compare_queries("Constraint", a_cursor, b_cursor, a_name, b_name, const_sql, [schemas, list(a_parts | b_parts)])
+    query_for_comparison("Constraint", a_info, a_cursor, const_sql, [schemas, list(a_parts | b_parts)])
+    query_for_comparison("Constraint", b_info, b_cursor, const_sql, [schemas, list(a_parts | b_parts)])
+
+    yield "--- {}".format(a_db.dsn)
+    yield "+++ {}".format(b_db.dsn)
+
+    all_rels = sorted(set(a_info) | set(b_info))
+    for rel in all_rels:
+        if a_info.get(rel) == b_info.get(rel):
+            continue
+
+        yield "@@ Relation {}".format(rel)
+        if rel not in a_info:
+            yield "+Relation {!r}".format(rel)
+            continue
+        if rel not in b_info:
+            yield "+Relation {!r}".format(rel)
+            continue
+
+        yield from compare_dicts(a_info[rel], b_info[rel])
 
 
 def compare(*, a_conn_str, b_conn_str, schemas, ignore_partitions):
     count = 0
     with psycopg2.connect(a_conn_str) as a_db, psycopg2.connect(b_conn_str) as b_db:
         for issue in compare_schema(a_db=a_db, b_db=b_db, schemas=schemas, ignore_partitions=ignore_partitions):
+            if issue.startswith("@@"):
+                count += 1
             print(issue)
-            count += 1
-    print("{} differences found".format(count))
+    print("Found differences in {} relations".format(count))
     return count
 
 
 def main(args=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--a-db", required=True, metavar="CONN_STR")
-    parser.add_argument("--b-db", required=True, metavar="CONN_STR")
-    parser.add_argument("--schema", required=True, action="append")
+    parser.add_argument("--schema", required=False, action="append")
     parser.add_argument("--ignore-partitions", action="store_true")
+    parser.add_argument("connection_string_1")
+    parser.add_argument("connection_string_2")
     pargs = parser.parse_args(args)
 
-    return compare(a_conn_str=pargs.a_db, b_conn_str=pargs.b_db, schemas=pargs.schema, ignore_partitions=pargs.ignore_partitions)
+    diffs = compare(
+        a_conn_str=pargs.connection_string_1,
+        b_conn_str=pargs.connection_string_2,
+        schemas=pargs.schema,
+        ignore_partitions=pargs.ignore_partitions,
+    )
+    return 1 if diffs else 0
 
 
 if __name__ == "__main__":
