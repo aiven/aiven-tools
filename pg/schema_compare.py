@@ -50,7 +50,7 @@ def gather_data(db, schemas, ignore_partitions):
     cursor.execute("SELECT * FROM information_schema.columns WHERE table_schema = ANY(%s)", [schemas])
     cols = cursor.fetchall()
 
-    ignored_properties = {"table_catalog", "udt_catalog", "ordinal_position", "dtd_identifier"}
+    ignored_properties = {"domain_catalog", "table_catalog", "udt_catalog", "ordinal_position", "dtd_identifier"}
     for col in cols:
         table = "{}.{}".format(col["table_schema"], col["table_name"])
         if table in parts:
